@@ -1,5 +1,6 @@
 # d0s_t0wn
 c0me 0n d0wn t0 d0s t0wn
+we got some blue team stuff and we got some red team stuff x0x
 
 ## INSTALLATION
 
