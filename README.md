@@ -23,6 +23,11 @@ pip3 install scapy hyper pysocks --break-system-packages
 python3 http2_rapid_request.py
 ```
 
+## to run H2-guard.py
+
+```bash
+python3 h2_guard.py
+```
 ----
 
 ## DISCLAIMER
