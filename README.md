@@ -98,14 +98,15 @@ sudo apt update && sudo apt install tor python3-requests python3-scapy nmap tsha
 pip3 install httpx[http2] scapy pysocks --break-system-packages
 sudo nmap --script-updatedb
 ```
+---
 
-## to run HTTP/2 RAPID REQUEST ATTACK:
+## HTTP/2 Rapid-Reset Flood 
+
+## run HTTP/2 RAPID REQUEST ATTACK:
 
 ```bash
 python3 http2_rapid_reset.py
 ```
-
-## HTTP/2 Rapid-Reset Flood 
 
 Overview
 
