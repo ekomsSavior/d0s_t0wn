@@ -16,7 +16,7 @@ Install required tools and libraries
 
 ```bash
 sudo apt update && sudo apt install tor python3-requests python3-scapy nmap tshark nghttp2-client -y
-pip3 install scapy hyper pysocks --break-system-packages
+pip3 install httpx[http2] scapy pysocks --break-system-packages
 ```
 
 ## to run HTTP/2 RAPID REQUEST ATTACK:
