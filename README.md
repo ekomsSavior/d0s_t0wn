@@ -309,5 +309,5 @@ It helps you **discover**, **measure**, and **validate** how your infrastructure
 
 ## DISCLAIMER
 
-This script is for testing network resilience with explicit permission. The HTTP/2 rapid-reset attack, enhanced with GOAWAY handling and HPACK-heavy headers, is highly disruptive. Unauthorized use could violate laws or terms of service.
+Only use this tool on networks you have permission to test on. user assumes all risk.
 
