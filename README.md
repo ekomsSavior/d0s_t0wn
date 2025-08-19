@@ -108,7 +108,7 @@ sudo nmap --script-updatedb
 python3 http2_rapid_reset.py
 ```
 
-Overview
+## Overview
 
 The http2 mode of the https2_rapid_reset.py script implements an HTTP/2 Rapid-Reset Flood, a low-bandwidth, high-impact attack designed to stress-test web servers by exploiting the HTTP/2 protocol's stream multiplexing. 
 
@@ -116,25 +116,8 @@ This mode sends rapid sequences of HTTP/2 HEADERS frames followed by RST_STREAM 
 
 Note: This script is intended for authorized network stress testing only. Unauthorized use may violate laws or terms of service.
 
-What Happens When You Run http2 Mode?
 
-HTTP/2 Connection Setup:
-
-Establishes TLS connections to the target IP and port with HTTP/2 protocol negotiation (ALPN: h2).
-
-Uses the hyper library to create HTTP/2 connections, ensuring compatibility with the HTTP/2 protocol.
-
-If Tor is enabled (USE_TOR = True), connections route through a SOCKS5 proxy (127.0.0.1:9050), though HTTP/2 over Tor may be unreliable.
-
-
-Server SETTINGS Parsing:
-
-Queries the server’s SETTINGS frame to determine SETTINGS_MAX_CONCURRENT_STREAMS (default: 100 if not specified).
-
-Caps concurrent streams per connection to avoid server backpressure, optimizing resource usage.
-
-
-Rapid-Reset Attack Loop:
+## Rapid-Reset Attack Loop:
 
 For each connection in each thread:
 Generates HPACK-heavy headers with:
@@ -148,7 +131,6 @@ Spoofed :authority and x-forwarded-for with random IPs to evade simple filters.
 
 Random user-agent from a list, including crawlers like Yahoo Slurp and DuckDuckBot (avoid mimicking DuckDuckBot’s IP ranges listed in the document).
 
-
 Sends a HEADERS frame to initiate a new stream, triggering server work (e.g., routing, DB queries).
 
 Immediately sends a RST_STREAM frame (error code: CANCEL, 0x8) to terminate the stream, wasting server resources.
@@ -159,7 +141,7 @@ Cycles stream IDs (incrementing by 2) up to the server’s SETTINGS_MAX_CONCURRE
 Pauses briefly (0.01s) to avoid client-side resource exhaustion.
 
 
-GOAWAY Handling:
+## GOAWAY Handling:
 
 Detects GOAWAY frames from the server (indicating connection termination, e.g., due to rate-limiting or resource limits).
 
@@ -168,25 +150,30 @@ Closes the affected connection and opens a new one to maintain continuous stream
 Ensures no requests are sent on doomed connections, improving efficiency and stability.
 
 
-Connection Management:
+## Connection Management:
 
 If a connection fails (e.g., socket error or HyperException), it’s closed and replaced with a new one.
+
 Maintains up to MAX_CONNECTIONS_PER_THREAD active connections per thread.
 Cleans up all connections when the attack duration expires or the script is stopped.
 
 
-Execution Control:
+## Execution Control:
 
 Runs for the specified duration (e.g., 60 seconds).
+
 If loop mode is enabled, repeats until interrupted (Ctrl+C).
+
 Prints status messages:
+
 Start: [~] Starting HTTP/2 Rapid-Reset Flood for <duration>s with <threads> threads...
+
 End: [✓] HTTP/2 Rapid-Reset Flood complete.
+
 Loop stop: [✘] Loop stopped by user.
 
+## Impact on the Target
 
-
-Impact on the Target
 The HTTP/2 Rapid-Reset Flood is designed to:
 
 Maximize Server CPU Usage: HPACK-heavy headers and rapid stream resets force the server to process complex headers and allocate resources for short-lived streams.
