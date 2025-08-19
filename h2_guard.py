@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # h2_guard.py — Safe HTTP/2 exposure + config auditor + rate-limit validator (no flood logic).
-# Usage: sudo python3 h2_guard.py
+# Usage: python3 h2_guard.py
 
-import os, sys, shutil, subprocess, re, time, socket, ssl, json, statistics
-from datetime import datetime, timezone
-from ipaddress import ip_address
+import os, sys, shutil, subprocess, datetime, re, time, socket, ssl, json, statistics
+from ipaddress import ip_address, ip_network
 
 LOOT = "loot"
 os.makedirs(LOOT, exist_ok=True)
 
-def which(name):
+def which(name): 
     return shutil.which(name)
 
 def run_cmd(cmd):
@@ -22,6 +21,12 @@ def run_cmd(cmd):
 def prompt(msg, default=None):
     v = input(f"{msg}{' ['+str(default)+']' if default is not None else ''}: ").strip()
     return v if v else default
+
+def yn(msg, default=True):
+    v = input(f"{msg} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    if v == "" and default: return True
+    if v == "" and not default: return False
+    return v in ("y","yes")
 
 # ---------- helpers ----------
 def is_private_or_local(host):
@@ -37,24 +42,7 @@ def is_private_or_local(host):
             return False
 
 def now_ts():
-    # timezone-aware UTC (avoids deprecation warnings)
-    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-
-def default_iface():
-    """
-    Best-effort default interface guess:
-    - Try 'ip route get 1.1.1.1'
-    - Fallback to 'eth0'
-    """
-    try:
-        out, rc = run_cmd(["ip", "route", "get", "1.1.1.1"])
-        if rc == 0:
-            m = re.search(r"dev\s+(\S+)", out)
-            if m:
-                return m.group(1)
-    except Exception:
-        pass
-    return "eth0"
+    return datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
 
 # ---------- OpenSSL ALPN fallback ----------
 def openssl_alpn_h2(host, port, timeout=5):
@@ -64,6 +52,7 @@ def openssl_alpn_h2(host, port, timeout=5):
     if not which("openssl"):
         return False
     try:
+        # -brief prints lines like "ALPN protocol: h2" on success
         cmd = [
             "openssl","s_client","-alpn","h2",
             "-connect", f"{host}:{port}",
@@ -107,6 +96,9 @@ def parse_nmap_h2(out):
 
         # Exit block on end marker or new script section
         if in_tls_alpn_block and (re.match(r'^\|_', line) or re.match(r'^\|\s+\w', line)):
+            # end of tls-alpn block (but the last line with |_ may still contain protocol)
+            # We don't add here; we only add when we explicitly saw 'h2' lines.
+            # Reset and continue
             in_tls_alpn_block = False
             continue
 
@@ -114,7 +106,7 @@ def parse_nmap_h2(out):
         if in_tls_alpn_block and cur_port:
             if re.match(r'^\|\s+h2\s*$', line):
                 h2_ports.add(cur_port)
-                # one h2 line is enough for this port
+                # Keep scanning; but one 'h2' is enough for this port
                 continue
 
     return sorted(h2_ports)
@@ -130,6 +122,7 @@ def active_scan(target, ports=None, all_ports=False):
         ports = ports or "443,80,8080,8443,9443,10443,50051"
         cmd = ["sudo","nmap","-p",ports,"-sV","--open","--script","tls-alpn",target]
 
+    # Optionally preflight: if tls-alpn missing, nmap returns non-zero; we'll still save output
     print(f"\n[+] Running nmap ALPN scan on {target} ...")
     out, rc = run_cmd(cmd)
     path = os.path.join(LOOT, f"h2_active_{target.replace('/','_')}_{now_ts()}.txt")
@@ -214,7 +207,7 @@ def passive_capture(iface, seconds=60, target_host=None):
     return None
 
 # ---------- SAFE rate-limit validator (HTTP/2; small capped requests) ----------
-def ratelimit_probe(url, total=200, rps=20, max_conns=10, timeout=5.0, method="GET", assume_owned=True):
+def ratelimit_probe(url, total=200, rps=20, max_conns=10, timeout=5.0, method="GET"):
     """
     Sends small, capped H2 requests to your host and checks whether you see 429/503
     and how latency behaves. No stream resets, no abuse. Requires httpx with h2.
@@ -232,8 +225,10 @@ def ratelimit_probe(url, total=200, rps=20, max_conns=10, timeout=5.0, method="G
         return None, "[!] Invalid URL."
 
     is_private = is_private_or_local(host)
-    if not is_private and not assume_owned:
-        return None, "[i] Skipping rate-limit probe on non-private host (assume_owned=False)."
+    if not is_private:
+        print("[!] Target is not detected as localhost/private IP.")
+        if not yn("I confirm I own this host and want to proceed", False):
+            return None, "[i] Aborted by user."
 
     # httpx client with HTTP/2 and connection caps
     limits = httpx.Limits(max_keepalive_connections=max_conns, max_connections=max_conns)
@@ -245,7 +240,7 @@ def ratelimit_probe(url, total=200, rps=20, max_conns=10, timeout=5.0, method="G
     started = time.perf_counter()
     interval = 1.0 / float(max(1, rps))
 
-    for _ in range(total):
+    for i in range(total):
         t0 = time.perf_counter()
         try:
             if method == "GET":
@@ -331,7 +326,7 @@ def mitigation_text(host, ports_h2, settings_map):
         lines.append("    set circuit breakers & retry budgets, and cap request queues.")
         lines.append("  • CDN/WAF: enable HTTP/2 rapid-reset protections; configure per-IP connection/stream caps.")
     for port, st in settings_map.items():
-        if not st:
+        if not st: 
             continue
         # Common key names seen from hyper's internal dict
         mcs = st.get("SETTINGS_MAX_CONCURRENT_STREAMS") or st.get("MAX_CONCURRENT_STREAMS") \
@@ -349,71 +344,78 @@ def main():
     print(r"""
 H2 Guard — HTTP/2 Exposure & Settings Auditor (safe)
 ---------------------------------------------------
-Auto-run mode (no Y/N prompts):
-- Quick ALPN discovery (nmap tls-alpn) + OpenSSL fallback
-- SETTINGS probe (safe single connection per h2 port)
-- Passive ALPN capture (tshark)
-- Safe rate-limit probe (tiny capped H2 GETs)
-- Mitigation checklist
+- Finds where ALPN=h2 is offered (nmap)
+- Reads server HTTP/2 SETTINGS (safe single connection)
+- Optional passive ALPN=h2 capture (tshark)
+- NEW: Safe rate-limit validator (tiny capped H2 requests; checks for 429/503)
+- Emits mitigation checklist
 """)
-    # ---- Target (still a prompt so you can specify host quickly)
     target = prompt("Target (IP/hostname or CIDR)", "127.0.0.1")
-
-    # ---- Active scan (auto: quick common ports)
-    ports = "443,80,8080,8443,9443,10443,50051"
+    # Active scan
+    quick = yn("Quick active scan of common HTTPS ports?", True)
     all_ports = False
+    ports = None
+    if quick:
+        ports = "443,80,8080,8443,9443,10443,50051"
+    else:
+        all_ports = yn("Scan ALL TCP ports with nmap? (slower)", False)
+        if not all_ports:
+            ports = prompt("Custom port list (e.g. 443,8443,50051)", "443,8443")
+
     h2_ports, err = active_scan(target, ports=ports, all_ports=all_ports)
-    if err:
+    if err: 
         print(err)
 
-    # ---- SETTINGS probe (auto)
+    # SETTINGS probe
     settings_map = {}
     if h2_ports:
         print("\n[+] Probing HTTP/2 SETTINGS (one safe connection per port)...")
         host_for_probe = target
+        # If target is a CIDR, SETTINGS will likely fail; we still try host as given.
         for p in h2_ports:
             st, e = probe_h2_settings(host_for_probe, p)
-            if e:
+            if e: 
                 print(f"  - {host_for_probe}:{p} → {e}")
             settings_map[p] = st
         with open(os.path.join(LOOT, f"h2_settings_{host_for_probe}_{now_ts()}.json"), "w") as f:
             json.dump(settings_map, f, indent=2, sort_keys=True)
         print("[✓] SETTINGS snapshot saved.")
 
-    # ---- Passive capture (auto)
-    iface = prompt("Interface (e.g., eth0, wlan0)", default_iface())
-    secs = int(prompt("Duration seconds", "60"))
-    host_filter = None
-    try:
-        # If target is a single IP/host, try to filter; if CIDR, skip.
-        ip_address(target); host_filter = target
-    except ValueError:
+    # Passive capture
+    if yn("Run passive ALPN=h2 capture with tshark?", False):
+        iface = prompt("Interface (e.g., eth0, wlan0)", "eth0")
+        secs = int(prompt("Duration seconds", "60"))
+        host_filter = None
         try:
-            host_filter = socket.gethostbyname(target)
-        except Exception:
-            host_filter = None
-    errp = passive_capture(iface, secs, host_filter)
-    if errp:
-        print(errp)
+            # If target is a single IP/host, try to filter; if CIDR, skip.
+            ip_address(target); host_filter = target
+        except ValueError:
+            try:
+                host_filter = socket.gethostbyname(target)
+            except Exception:
+                host_filter = None
+        errp = passive_capture(iface, secs, host_filter)
+        if errp: 
+            print(errp)
 
-    # ---- Rate-limit validation (auto)
-    # Build a default URL from target; if CIDR or non-HTTPS, user can edit the default quickly.
-    url_default = "https://%s/" % (target if not re.match(r'.*/', target) else target.rstrip('/'))
-    url = prompt("Full URL to probe (must be your host)", url_default)
-    total = int(prompt("Total requests (<=1000 recommended)", "200"))
-    rps   = int(prompt("Target send rate (RPS)", "20"))
-    conns = int(prompt("Max concurrent connections", "10"))
-    timeout = float(prompt("Per-request timeout (seconds)", "5.0"))
-    summary, perr = ratelimit_probe(url, total=total, rps=rps, max_conns=conns, timeout=timeout, assume_owned=True)
-    if perr:
-        print(perr)
-    else:
-        save_probe_report(summary)
+    # Rate-limit validation (SAFE)
+    if yn("Run safe HTTP/2 rate-limit validation (tiny capped GETs)?", True):
+        url_default = "https://%s/" % (target if not re.match(r'.*/', target) else target.rstrip('/'))
+        url = prompt("Full URL to probe (must be your host)", url_default)
+        total = int(prompt("Total requests (<=1000 recommended)", "200"))
+        rps   = int(prompt("Target send rate (RPS)", "20"))
+        conns = int(prompt("Max concurrent connections", "10"))
+        timeout = float(prompt("Per-request timeout (seconds)", "5.0"))
+        summary, perr = ratelimit_probe(url, total=total, rps=rps, max_conns=conns, timeout=timeout)
+        if perr:
+            print(perr)
+        else:
+            save_probe_report(summary)
 
-    # ---- Mitigation checklist (auto)
+    # Mitigation checklist
     checklist = mitigation_text(target, h2_ports or [], settings_map)
     path = os.path.join(LOOT, f"h2_mitigation_{target.replace('/','_')}_{now_ts()}.txt")
-    with open(path,"w") as f:
+    with open(path,"w") as f: 
         f.write(checklist)
     print(f"\n[✓] Mitigation checklist saved → {path}")
     print("\n[Done]")
