@@ -267,7 +267,7 @@ It helps you **discover**, **measure**, and **validate** how your infrastructure
 1. Run:
 
    ```bash
-   python3 h2_guard.py
+   sudo python3 h2_guard.py
    ```
 2. Enter target IP/hostname or CIDR.
 3. Choose quick scan (common ports) or full port scan.
