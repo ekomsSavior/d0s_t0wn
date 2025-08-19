@@ -113,7 +113,7 @@ sudo nmap --script-updatedb
 ## to run HTTP/2 RAPID REQUEST ATTACK:
 
 ```bash
-python3 http2_rapid_request.py
+python3 http2_rapid_reset.py
 ```
 
 ## HTTP/2 Rapid-Reset Flood 
