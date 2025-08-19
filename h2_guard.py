@@ -8,7 +8,8 @@ from ipaddress import ip_address, ip_network
 LOOT = "loot"
 os.makedirs(LOOT, exist_ok=True)
 
-def which(name): return shutil.which(name)
+def which(name): 
+    return shutil.which(name)
 
 def run_cmd(cmd):
     try:
@@ -43,36 +44,107 @@ def is_private_or_local(host):
 def now_ts():
     return datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
 
-# ---------- Active scan (nmap ssl-enum-alpn) ----------
+# ---------- OpenSSL ALPN fallback ----------
+def openssl_alpn_h2(host, port, timeout=5):
+    """
+    Returns True if OpenSSL confirms ALPN 'h2' is negotiated on host:port.
+    """
+    if not which("openssl"):
+        return False
+    try:
+        # -brief prints lines like "ALPN protocol: h2" on success
+        cmd = [
+            "openssl","s_client","-alpn","h2",
+            "-connect", f"{host}:{port}",
+            "-servername", host,
+            "-brief","-tls1_2"
+        ]
+        out, rc = run_cmd(cmd)
+        return ("ALPN protocol: h2" in out)
+    except Exception:
+        return False
+
+# ---------- Active scan (nmap tls-alpn) ----------
 def parse_nmap_h2(out):
+    """
+    Parse Nmap tls-alpn output. Only mark a port as h2 if the tls-alpn section
+    explicitly lists 'h2'.
+    Example:
+      | tls-alpn:
+      |   h2
+      |   http/1.1
+      |_  http/1.0
+    """
     h2_ports = set()
     cur_port = None
-    for line in out.splitlines():
+    in_tls_alpn_block = False
+
+    for raw in out.splitlines():
+        line = raw.rstrip("\n")
+
+        # Track open port lines like: "443/tcp open  https"
         m = re.match(r'^(\d{1,5})/tcp\s+open', line)
-        if m: cur_port = m.group(1)
-        if "ssl-enum-alpn" in line or "ALPN" in line:
-            pass
-        if re.search(r'\bh2\b', line):
-            if cur_port: h2_ports.add(cur_port)
+        if m:
+            cur_port = m.group(1)
+            in_tls_alpn_block = False
+            continue
+
+        # Enter tls-alpn section
+        if re.match(r'^\|\s+tls-alpn:\s*$', line):
+            in_tls_alpn_block = True
+            continue
+
+        # Exit block on end marker or new script section
+        if in_tls_alpn_block and (re.match(r'^\|_', line) or re.match(r'^\|\s+\w', line)):
+            # end of tls-alpn block (but the last line with |_ may still contain protocol)
+            # We don't add here; we only add when we explicitly saw 'h2' lines.
+            # Reset and continue
+            in_tls_alpn_block = False
+            continue
+
+        # Within block, look for protocol lines like: "|   h2"
+        if in_tls_alpn_block and cur_port:
+            if re.match(r'^\|\s+h2\s*$', line):
+                h2_ports.add(cur_port)
+                # Keep scanning; but one 'h2' is enough for this port
+                continue
+
     return sorted(h2_ports)
 
 def active_scan(target, ports=None, all_ports=False):
     if not which("nmap"):
         return None, "[!] nmap not found (install: sudo apt install nmap)"
 
+    # Prefer tls-alpn (correct NSE)
     if all_ports:
-        cmd = ["sudo","nmap","-p-","-sV","--open","--script","ssl-enum-alpn",target]
+        cmd = ["sudo","nmap","-p-","-sV","--open","--script","tls-alpn",target]
     else:
         ports = ports or "443,80,8080,8443,9443,10443,50051"
-        cmd = ["sudo","nmap","-p",ports,"-sV","--open","--script","ssl-enum-alpn",target]
+        cmd = ["sudo","nmap","-p",ports,"-sV","--open","--script","tls-alpn",target]
 
+    # Optionally preflight: if tls-alpn missing, nmap returns non-zero; we'll still save output
     print(f"\n[+] Running nmap ALPN scan on {target} ...")
     out, rc = run_cmd(cmd)
     path = os.path.join(LOOT, f"h2_active_{target.replace('/','_')}_{now_ts()}.txt")
     with open(path,"w") as f: f.write(out)
-    if rc != 0: print("[!] nmap returned non-zero exit; check output.")
+    if rc != 0:
+        print("[!] nmap returned non-zero exit; check output. (Tip: sudo nmap --script-help tls-alpn)")
+
+    h2_ports = parse_nmap_h2(out)
+
+    # Fallback with OpenSSL if no hits and a concrete port list is known
+    if (not h2_ports) and ports:
+        print("[i] No h2 ports found by Nmap; attempting OpenSSL ALPN fallback ...")
+        for p in str(ports).split(","):
+            p = p.strip()
+            if p.isdigit() and openssl_alpn_h2(target, p):
+                h2_ports.append(p)
+        h2_ports = sorted(set(h2_ports))
+        if h2_ports:
+            print(f"[+] OpenSSL confirmed h2 on: {', '.join(h2_ports)}")
+
     print(f"[✓] Active scan saved → {path}")
-    return parse_nmap_h2(out), None
+    return h2_ports, None
 
 # ---------- HTTP/2 SETTINGS probe (safe single connection) ----------
 def probe_h2_settings(host, port):
@@ -254,7 +326,8 @@ def mitigation_text(host, ports_h2, settings_map):
         lines.append("    set circuit breakers & retry budgets, and cap request queues.")
         lines.append("  • CDN/WAF: enable HTTP/2 rapid-reset protections; configure per-IP connection/stream caps.")
     for port, st in settings_map.items():
-        if not st: continue
+        if not st: 
+            continue
         # Common key names seen from hyper's internal dict
         mcs = st.get("SETTINGS_MAX_CONCURRENT_STREAMS") or st.get("MAX_CONCURRENT_STREAMS") \
               or st.get("SETTINGS_MAX_CONCURRENT_STREAMS".lower()) or st.get("4")
@@ -262,7 +335,7 @@ def mitigation_text(host, ports_h2, settings_map):
             lines.append(f"- Port {port}: peer SETTINGS_MAX_CONCURRENT_STREAMS ≈ {mcs} (observed).")
             lines.append("  • If high, lower it to reduce per-connection fanout; set short recv/idle timeouts.")
     lines.append("\n# Discovery commands you can reuse")
-    lines.append("sudo nmap -p 443,80,8080,8443,9443,10443,50051 --script ssl-enum-alpn <target>")
+    lines.append("sudo nmap -p 443,80,8080,8443,9443,10443,50051 --script tls-alpn <target>")
     lines.append('sudo tshark -i <iface> -Y "tls.handshake.extensions_alpn_str == h2"')
     return "\n".join(lines)
 
@@ -290,7 +363,8 @@ H2 Guard — HTTP/2 Exposure & Settings Auditor (safe)
             ports = prompt("Custom port list (e.g. 443,8443,50051)", "443,8443")
 
     h2_ports, err = active_scan(target, ports=ports, all_ports=all_ports)
-    if err: print(err)
+    if err: 
+        print(err)
 
     # SETTINGS probe
     settings_map = {}
@@ -300,7 +374,8 @@ H2 Guard — HTTP/2 Exposure & Settings Auditor (safe)
         # If target is a CIDR, SETTINGS will likely fail; we still try host as given.
         for p in h2_ports:
             st, e = probe_h2_settings(host_for_probe, p)
-            if e: print(f"  - {host_for_probe}:{p} → {e}")
+            if e: 
+                print(f"  - {host_for_probe}:{p} → {e}")
             settings_map[p] = st
         with open(os.path.join(LOOT, f"h2_settings_{host_for_probe}_{now_ts()}.json"), "w") as f:
             json.dump(settings_map, f, indent=2, sort_keys=True)
@@ -320,7 +395,8 @@ H2 Guard — HTTP/2 Exposure & Settings Auditor (safe)
             except Exception:
                 host_filter = None
         errp = passive_capture(iface, secs, host_filter)
-        if errp: print(errp)
+        if errp: 
+            print(errp)
 
     # Rate-limit validation (SAFE)
     if yn("Run safe HTTP/2 rate-limit validation (tiny capped GETs)?", True):
@@ -339,7 +415,8 @@ H2 Guard — HTTP/2 Exposure & Settings Auditor (safe)
     # Mitigation checklist
     checklist = mitigation_text(target, h2_ports or [], settings_map)
     path = os.path.join(LOOT, f"h2_mitigation_{target.replace('/','_')}_{now_ts()}.txt")
-    with open(path,"w") as f: f.write(checklist)
+    with open(path,"w") as f: 
+        f.write(checklist)
     print(f"\n[✓] Mitigation checklist saved → {path}")
     print("\n[Done]")
 
