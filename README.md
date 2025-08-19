@@ -75,17 +75,6 @@ This side-by-side process helps highlight **the exact gap between stress surface
 
 ---
 
-## Defensive Takeaways
-
-* **Cap per-connection fanout**: reduce `MAX_CONCURRENT_STREAMS` (50–100 typical).
-* **Shorten idle/recv timeouts**: don’t let “dead” streams live long.
-* **Propagate cancels upstream**: ensure resets stop backend work immediately.
-* **Enforce per-IP budgets**: connections, streams, and req/sec should all be capped.
-* **Trip early on errors**: close connections that send malformed frames or flow-control violations.
-* **Audit regularly**: use `h2_guard.py` as part of your CI/CD or change review to catch regressions.
-
----
-
 ## Legal / Ethical Notice
 
 * `http2_rapid_reset.py` is for **educational demonstration in controlled environments only**. Do not deploy it against networks or systems you do not own or lack explicit authorization to test.
@@ -120,20 +109,27 @@ python3 http2_rapid_reset.py
 
 Overview
 
-The http2 mode of the https2_rapid_reset.py script implements an HTTP/2 Rapid-Reset Flood, a low-bandwidth, high-impact attack designed to stress-test web servers by exploiting the HTTP/2 protocol's stream multiplexing. This mode sends rapid sequences of HTTP/2 HEADERS frames followed by RST_STREAM frames to maximize server resource consumption while minimizing client bandwidth usage.
+The http2 mode of the https2_rapid_reset.py script implements an HTTP/2 Rapid-Reset Flood, a low-bandwidth, high-impact attack designed to stress-test web servers by exploiting the HTTP/2 protocol's stream multiplexing. 
+
+This mode sends rapid sequences of HTTP/2 HEADERS frames followed by RST_STREAM frames to maximize server resource consumption while minimizing client bandwidth usage.
+
 Note: This script is intended for authorized network stress testing only. Unauthorized use may violate laws or terms of service.
+
 What Happens When You Run http2 Mode?
 
 HTTP/2 Connection Setup:
 
 Establishes TLS connections to the target IP and port with HTTP/2 protocol negotiation (ALPN: h2).
+
 Uses the hyper library to create HTTP/2 connections, ensuring compatibility with the HTTP/2 protocol.
+
 If Tor is enabled (USE_TOR = True), connections route through a SOCKS5 proxy (127.0.0.1:9050), though HTTP/2 over Tor may be unreliable.
 
 
 Server SETTINGS Parsing:
 
 Queries the server’s SETTINGS frame to determine SETTINGS_MAX_CONCURRENT_STREAMS (default: 100 if not specified).
+
 Caps concurrent streams per connection to avoid server backpressure, optimizing resource usage.
 
 
@@ -142,14 +138,20 @@ Rapid-Reset Attack Loop:
 For each connection in each thread:
 Generates HPACK-heavy headers with:
 Randomized :path (e.g., /?q=1234).
+
 Large cookie fields (session ID, multiple random parameters, and a token) to inflate server HPACK decoding costs.
+
 Repeated headers (accept, accept-encoding, cache-control, pragma) to increase CPU load.
+
 Spoofed :authority and x-forwarded-for with random IPs to evade simple filters.
+
 Random user-agent from a list, including crawlers like Yahoo Slurp and DuckDuckBot (avoid mimicking DuckDuckBot’s IP ranges listed in the document).
 
 
 Sends a HEADERS frame to initiate a new stream, triggering server work (e.g., routing, DB queries).
+
 Immediately sends a RST_STREAM frame (error code: CANCEL, 0x8) to terminate the stream, wasting server resources.
+
 Cycles stream IDs (incrementing by 2) up to the server’s SETTINGS_MAX_CONCURRENT_STREAMS limit.
 
 
@@ -159,7 +161,9 @@ Pauses briefly (0.01s) to avoid client-side resource exhaustion.
 GOAWAY Handling:
 
 Detects GOAWAY frames from the server (indicating connection termination, e.g., due to rate-limiting or resource limits).
+
 Closes the affected connection and opens a new one to maintain continuous stream churn.
+
 Ensures no requests are sent on doomed connections, improving efficiency and stability.
 
 
@@ -185,18 +189,46 @@ Impact on the Target
 The HTTP/2 Rapid-Reset Flood is designed to:
 
 Maximize Server CPU Usage: HPACK-heavy headers and rapid stream resets force the server to process complex headers and allocate resources for short-lived streams.
+
 Minimize Client Bandwidth: Sends minimal data (HEADERS + RST_STREAM) while triggering significant server-side work.
+
 Exploit Protocol Efficiency: Leverages HTTP/2’s multiplexing to open multiple streams per connection, amplifying resource consumption.
+
 Evade Basic Defenses: Random headers, spoofed IPs, and GOAWAY handling make the attack harder to filter or throttle.
 
 ----
 
-# H2 Guard — HTTP/2 Exposure & Defense Auditor
+## H2 Guard — HTTP/2 Exposure & Defense Auditor
 
 `h2_guard.py` is a **safe** tool for defenders.
 It helps you **discover**, **measure**, and **validate** how your infrastructure exposes HTTP/2, and whether basic mitigations (rate limits, stream caps, timeouts) are in place.
 
  **Important:** This script never performs flooding or reset attacks. All probes are low-impact, capped, and designed for defenders to audit their own servers.
+
+---
+
+## Typical Workflow
+
+1. Run:
+
+   ```bash
+   sudo python3 h2_guard.py
+   ```
+2. Enter target IP/hostname or CIDR.
+3. Choose quick scan (common ports) or full port scan.
+4. Script will:
+
+   * Discover h2 endpoints.
+   * Probe SETTINGS.
+   * Optionally capture traffic.
+   * Optionally validate rate limits safely.
+5. Review artifacts in `loot/`:
+
+   * `h2_active_*.txt` → ALPN discovery
+   * `h2_settings_*.json` → SETTINGS snapshots
+   * `h2_passive_*.txt` → live captures
+   * `h2_ratelimit_*.{json,txt}` → rate-limit probe results
+   * `h2_mitigation_*.txt` → mitigation checklist
 
 ---
 
@@ -263,30 +295,6 @@ It helps you **discover**, **measure**, and **validate** how your infrastructure
 
 ---
 
-## Typical Workflow
-
-1. Run:
-
-   ```bash
-   sudo python3 h2_guard.py
-   ```
-2. Enter target IP/hostname or CIDR.
-3. Choose quick scan (common ports) or full port scan.
-4. Script will:
-
-   * Discover h2 endpoints.
-   * Probe SETTINGS.
-   * Optionally capture traffic.
-   * Optionally validate rate limits safely.
-5. Review artifacts in `loot/`:
-
-   * `h2_active_*.txt` → ALPN discovery
-   * `h2_settings_*.json` → SETTINGS snapshots
-   * `h2_passive_*.txt` → live captures
-   * `h2_ratelimit_*.{json,txt}` → rate-limit probe results
-   * `h2_mitigation_*.txt` → mitigation checklist
-
----
 
 ## Example Defender Use Cases
 
@@ -294,6 +302,16 @@ It helps you **discover**, **measure**, and **validate** how your infrastructure
 * **After hardening:** Validate your `limit_req`, stream caps, and CDN protections trigger 429/503 as expected.
 * **During monitoring:** Capture ALPN handshakes to see if unexpected ports negotiate HTTP/2.
 * **Audit evidence:** Ship the `loot/` artifacts into your SIEM / compliance reports.
+---
+  
+## Defensive Takeaways
+
+* **Cap per-connection fanout**: reduce `MAX_CONCURRENT_STREAMS` (50–100 typical).
+* **Shorten idle/recv timeouts**: don’t let “dead” streams live long.
+* **Propagate cancels upstream**: ensure resets stop backend work immediately.
+* **Enforce per-IP budgets**: connections, streams, and req/sec should all be capped.
+* **Trip early on errors**: close connections that send malformed frames or flow-control violations.
+* **Audit regularly**: use `h2_guard.py` as part of your CI/CD or change review to catch regressions.
 
 ---
 
