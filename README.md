@@ -1,7 +1,97 @@
 # d0s_t0wn
 ### c0me 0n d0wn t0 d0s t0wn
 
-we got some blue team stuff and we got some red team stuff x0x
+# HTTP/2 Rapid Reset d0s & H2 Guard
+
+## Overview
+
+This repository contains **two complementary tools** for studying and mitigating the HTTP/2 “Rapid Reset” class of denial-of-service vulnerabilities (see [CVE-2025-8671](https://nvd.nist.gov/)):
+
+* **`http2_rapid_reset.py`** — A python scripted stressor that demonstrates how attackers can abuse HTTP/2’s stream accounting mismatches (“imaginary rules”) to trigger excessive server work.
+* **`h2_guard.py`** — A safe auditing utility for defenders. It scans for HTTP/2 exposure, inspects SETTINGS, optionally captures ALPN handshakes, runs capped/safe rate-limit probes, and produces mitigation checklists.
+
+Together, they show both sides of the coin: where the protocol cracks under pressure, and how operators can detect and harden their own stacks.
+
+---
+
+## Background: The “Imaginary Rules” in HTTP/2
+
+HTTP/2 multiplexes many streams over a single connection. On paper, the spec assumes:
+
+* **Resets stop work** — once a stream is reset (`RST_STREAM`), processing halts.
+* **Counters align** — stream/accounting at the protocol layer matches backend reality.
+* **Flow control & headers protect** — windows and header size limits prevent excess cost.
+
+In practice, these assumptions (“imaginary rules”) often **don’t hold**. Backend tasks may continue after resets, counters may drift, and error handling can be CPU-expensive.
+Attackers exploit this gap by **opening many streams, triggering resets rapidly, or provoking flow-control/header errors**—leaving servers chewing on “dead” work.
+
+---
+
+## Script Roles
+
+### 1. `http2_rapid_reset.py` (attacker)
+
+* Opens multiple HTTP/2 connections and multiplexed streams.
+* Cycles through tactics:
+
+  * **Client resets**: send HEADERS then immediately `RST_STREAM(CANCEL)`.
+  * **Malformed headers**: oversized/invalid HPACK to make the *server* issue a reset.
+  * **Flow control violations**: push DATA beyond window limits.
+* Demonstrates how servers with weak propagation or high `MAX_CONCURRENT_STREAMS` continue burning CPU/memory even after “resets.”
+* Also includes other classic flood modes (HTTP/1 floods, TLS handshakes, slow POST, UDP/TCP floods, etc.) for comparative testing.
+
+ **Note:** This script is a **stressor / red-team simulator**. Running it against systems you don’t own or lack permission for is illegal.
+
+---
+
+### 2. `h2_guard.py` (defender)
+
+Focuses on safe, defensive inspection:
+
+* **Active scan** — uses nmap’s `ssl-enum-alpn` to identify which ports negotiate ALPN=h2.
+* **SETTINGS probe** — makes a *single safe HTTP/2 connection* to read server `SETTINGS` (e.g. `MAX_CONCURRENT_STREAMS`).
+* **Passive capture** — optional tshark capture of ALPN=h2 handshakes on an interface.
+* **Rate-limit validator** — sends **tiny capped GET/HEAD requests** (no resets, no abuse) to check whether your stack emits `429 Too Many Requests` or `503 Overload` before latency degrades.
+* **Mitigation checklist** — generates actionable hardening steps per server, with vendor-specific knobs (NGINX, HAProxy, Envoy, CDN/WAF).
+
+Artifacts are written to the `loot/` directory (`h2_active_*.txt`, `h2_settings_*.json`, `h2_ratelimit_*.json`, `h2_mitigation_*.txt`).
+
+---
+
+## Example Workflow
+
+1. **Red-team simulation** (lab only)
+   Run `http2_rapid_reset.py` against a controlled lab server to demonstrate how resets or malformed frames impact resource consumption.
+
+2. **Blue-team audit**
+   Run `h2_guard.py` against the same host:
+
+   * Identify which ports are offering HTTP/2.
+   * Capture observed SETTINGS, especially `MAX_CONCURRENT_STREAMS`.
+   * Check if your server actually responds with `429/503` under capped, safe load.
+   * Review the auto-generated mitigation checklist.
+
+This side-by-side process helps highlight **the exact gap between stress surface and protection surface.**
+
+---
+
+## Defensive Takeaways
+
+* **Cap per-connection fanout**: reduce `MAX_CONCURRENT_STREAMS` (50–100 typical).
+* **Shorten idle/recv timeouts**: don’t let “dead” streams live long.
+* **Propagate cancels upstream**: ensure resets stop backend work immediately.
+* **Enforce per-IP budgets**: connections, streams, and req/sec should all be capped.
+* **Trip early on errors**: close connections that send malformed frames or flow-control violations.
+* **Audit regularly**: use `h2_guard.py` as part of your CI/CD or change review to catch regressions.
+
+---
+
+## Legal / Ethical Notice
+
+* `http2_rapid_reset.py` is for **educational demonstration in controlled environments only**. Do not deploy it against networks or systems you do not own or lack explicit authorization to test.
+* `h2_guard.py` is **safe for production audits** when run against your own infrastructure.
+
+---
 
 ## INSTALLATION
 
@@ -90,8 +180,6 @@ Loop stop: [✘] Loop stopped by user.
 
 
 
-
-
 Impact on the Target
 The HTTP/2 Rapid-Reset Flood is designed to:
 
@@ -99,38 +187,6 @@ Maximize Server CPU Usage: HPACK-heavy headers and rapid stream resets force the
 Minimize Client Bandwidth: Sends minimal data (HEADERS + RST_STREAM) while triggering significant server-side work.
 Exploit Protocol Efficiency: Leverages HTTP/2’s multiplexing to open multiple streams per connection, amplifying resource consumption.
 Evade Basic Defenses: Random headers, spoofed IPs, and GOAWAY handling make the attack harder to filter or throttle.
-
-Sequence Diagrams
-Below are simplified sequence diagrams illustrating the HTTP/2 Rapid-Reset Flood’s behavior:
-
-```
-Proxy → App
-Client                Proxy                 App
-|                     |                    |
-|--- HEADERS -------->|                    |
-|                     |--- Dispatch ----->|
-|                     |                    | [Work: routing, auth, DB]
-|--- RST_STREAM ----->|                    |
-|                     |--- Cancel -------->| [Late cancel; work wasted]
-|                     |                    |
-```
-
-Effect: HEADERS triggers app processing; RST_STREAM cancels it, often after partial work is done.
-
-```
-Proxy → Mesh → Services
-Client                Proxy                 Mesh                Service
-|                     |                    |                    |
-|--- HEADERS -------->|                    |                    |
-|                     |--- Fan-out ------>|                    |
-|                     |                    |--- Request ------>| [Work: DB, cache]
-|--- RST_STREAM ----->|                    |                    |
-|                     |--- Cancel -------->|                    |
-|                     |                    |--- Cancel -------->| [Late cancel; work wasted]
-|                     |                    |                    |
-```
-
-Effect: HEADERS propagates through the mesh, triggering work across services; RST_STREAM wastes resources at multiple layers.
 
 ----
 
