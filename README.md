@@ -15,7 +15,7 @@ cd d0s_t0wn
 Install required tools and libraries
 
 ```bash
-sudo apt update && sudo apt install tor python3-requests python3-scapy -y
+sudo apt update && sudo apt install tor python3-requests python3-scapy nmap tshark nghttp2-client -y
 pip3 install scapy hyper pysocks --break-system-packages
 ```
 
