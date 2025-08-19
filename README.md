@@ -102,6 +102,8 @@ Evade Basic Defenses: Random headers, spoofed IPs, and GOAWAY handling make the 
 
 Sequence Diagrams
 Below are simplified sequence diagrams illustrating the HTTP/2 Rapid-Reset Flood’s behavior:
+
+```
 Proxy → App
 Client                Proxy                 App
 |                     |                    |
@@ -111,10 +113,11 @@ Client                Proxy                 App
 |--- RST_STREAM ----->|                    |
 |                     |--- Cancel -------->| [Late cancel; work wasted]
 |                     |                    |
-
+```
 
 Effect: HEADERS triggers app processing; RST_STREAM cancels it, often after partial work is done.
 
+```
 Proxy → Mesh → Services
 Client                Proxy                 Mesh                Service
 |                     |                    |                    |
@@ -125,7 +128,7 @@ Client                Proxy                 Mesh                Service
 |                     |--- Cancel -------->|                    |
 |                     |                    |--- Cancel -------->| [Late cancel; work wasted]
 |                     |                    |                    |
-
+```
 
 Effect: HEADERS propagates through the mesh, triggering work across services; RST_STREAM wastes resources at multiple layers.
 
