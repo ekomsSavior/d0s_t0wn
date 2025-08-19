@@ -132,12 +132,6 @@ Client                Proxy                 Mesh                Service
 
 Effect: HEADERS propagates through the mesh, triggering work across services; RST_STREAM wastes resources at multiple layers.
 
-
-## to run H2-guard.py
-
-```bash
-python3 h2_guard.py
-```
 ----
 
 # H2 Guard — HTTP/2 Exposure & Defense Auditor
